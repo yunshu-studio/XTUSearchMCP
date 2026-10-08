@@ -1,0 +1,15 @@
+{
+  "name": "xtu-search-mcp",
+  "version": "2.3.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "migrate": "wrangler d1 migrations apply xtu-search-mcp --remote",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.144.0"
+  }
+}

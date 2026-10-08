@@ -1,0 +1,55 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "xtu-search-mcp",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-08",
+  "compatibility_flags": ["text_decoder_cjk_decoder"],
+  "workers_dev": true,
+  "placement": { "mode": "smart" },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "enabled": true, "head_sampling_rate": 1, "persist": true, "invocation_logs": true },
+    "traces": { "enabled": true, "head_sampling_rate": 0.1, "persist": true }
+  },
+  "vars": {
+    "EMBED_MODEL": "@cf/baai/bge-m3"
+  },
+  "ai": { "binding": "AI" },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "xtu-search-mcp",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "xtu-search-mcp"
+    }
+  ],
+  "vectorize": [
+    {
+      "binding": "VECTORIZE",
+      "index_name": "xtu-search-index"
+    }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "CRAWL_QUEUE", "queue": "xtu-search-crawl" }
+    ],
+    "consumers": [
+      {
+        "queue": "xtu-search-crawl",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 4,
+        "dead_letter_queue": "xtu-search-crawl-dlq"
+      }
+    ]
+  },
+  "triggers": {
+    "crons": ["0 */6 * * *"]
+  }
+}
