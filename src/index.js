@@ -6,6 +6,11 @@ const SEARCH_TEST_TERMS = ["通知", "湘潭大学"];
 const MAX_LIVE_SOURCES = 24;
 const MAX_SEARCH_RESULTS = 50;
 const SESSION_TTL_SECONDS = 12 * 60 * 60;
+const CRAWL_FRESH_MS = 72 * 60 * 60 * 1000;
+const SEARCH_INDEX_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
+const LIVE_AUTO_INDEX_LIMIT = 3;
+const CRAWL_ROOT_LINK_LIMIT = 30;
+const CRAWL_SECTION_LINK_LIMIT = 15;
 const textEncoder = new TextEncoder();
 
 const BUILTIN_EMPLOYMENT = {
@@ -56,7 +61,7 @@ export default {
         message.ack();
       } catch (error) {
         console.error("queue_job_failed", message.body, error?.stack || error);
-        message.retry({ delaySeconds: 120 });
+        message.retry({ delaySeconds: 300 });
       }
     }
   },
@@ -143,7 +148,9 @@ async function handleAdminApi(request, env, ctx) {
       validation_message: validation.message,
     });
     await writeAudit(env, session.user, "source.create", source.id, { base_url: source.base_url, source_kind: source.source_kind });
-    if (source.enabled && source.adapter !== "employment") ctx.waitUntil(env.CRAWL_QUEUE.send({ type: "crawl_page", sourceId: source.id, url: source.base_url, depth: 0, force: true }));
+    if (source.enabled && sourceKind(source) === "crawl") {
+      ctx.waitUntil(env.CRAWL_QUEUE.send({ type: "crawl_page", sourceId: source.id, url: source.base_url, depth: 0, force: true }));
+    }
     return json({ ok: true, source }, { status: 201 });
   }
 
@@ -224,7 +231,7 @@ async function handleMcp(request, env, ctx) {
       return cors(json(rpcResult(id, {
         protocolVersion: MCP_PROTOCOL,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: APP_NAME, title: "湘潭大学统一搜索", version: "2.3.2" },
+        serverInfo: { name: APP_NAME, title: "湘潭大学统一搜索", version: "2.3.3" },
       })));
     }
     if (rpc.method === "notifications/initialized") return cors(new Response(null, { status: 202 }));
@@ -388,9 +395,8 @@ async function unifiedSearch(query, requestedSourceIds, mode, limit, env, ctx) {
     .sort((a, b) => ((b.origin === "hybrid") - (a.origin === "hybrid")) || ((b.score || 0) - (a.score || 0)))
     .slice(0, limit);
 
-  const toIndex = liveResults.filter((x) => x.url && x.source_id && !x.url.includes("bysjy.com.cn")).slice(0, 20);
-  if (toIndex.length) {
-    ctx.waitUntil(Promise.allSettled(toIndex.map((item) => env.CRAWL_QUEUE.send({ type: "index_url", sourceId: item.source_id, url: item.url, force: false }))));
+  if (liveResults.length) {
+    ctx.waitUntil(enqueueFreshLiveResults(liveResults, env));
   }
 
   return {
@@ -545,9 +551,55 @@ async function getArticleForMcp(input, env, ctx) {
 async function scheduleRefresh(env) {
   const sources = await listSources(env, { includeDisabled: false });
   for (const source of sources) {
-    if (source.adapter !== "general") continue;
+    // Native-search sources are refreshed opportunistically from search results.
+    // Only crawl-only sources need scheduled site traversal.
+    if (sourceKind(source) !== "crawl") continue;
+    if (await isCrawlUrlFresh(source.id, source.base_url, env, CRAWL_FRESH_MS)) continue;
     await env.CRAWL_QUEUE.send({ type: "crawl_page", sourceId: source.id, url: source.base_url, depth: 0, force: false });
   }
+}
+
+async function enqueueFreshLiveResults(liveResults, env) {
+  const jobs = [];
+  const seen = new Set();
+  for (const item of liveResults) {
+    if (!item?.url || !item?.source_id || item.url.includes("bysjy.com.cn")) continue;
+    let url;
+    try { url = normalizeUrl(item.url); } catch { continue; }
+    if (seen.has(url)) continue;
+    seen.add(url);
+
+    const existing = await env.DB.prepare("SELECT indexed_at FROM articles WHERE url=? LIMIT 1").bind(url).first();
+    if (existing?.indexed_at && Date.now() - Date.parse(existing.indexed_at) < SEARCH_INDEX_FRESH_MS) continue;
+
+    jobs.push({ body: { type: "index_url", sourceId: item.source_id, url, force: false } });
+    if (jobs.length >= LIVE_AUTO_INDEX_LIMIT) break;
+  }
+  if (jobs.length) await env.CRAWL_QUEUE.sendBatch(jobs);
+}
+
+async function isCrawlUrlFresh(sourceId, url, env, maxAgeMs = CRAWL_FRESH_MS) {
+  const normalized = normalizeUrl(url);
+  const id = await sha256Hex(`${sourceId}\n${normalized}`);
+  const row = await env.DB.prepare("SELECT last_crawled_at FROM crawl_seen WHERE id=? LIMIT 1").bind(id).first();
+  return Boolean(row?.last_crawled_at && Date.now() - Date.parse(row.last_crawled_at) < maxAgeMs);
+}
+
+async function filterFreshCrawlLinks(source, links, env) {
+  if (!links.length) return [];
+  const pairs = await Promise.all(links.map(async (link) => ({
+    link,
+    id: await sha256Hex(`${source.id}\n${normalizeUrl(link)}`),
+  })));
+  const ids = pairs.map((x) => x.id);
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = await env.DB.prepare(`SELECT id,last_crawled_at FROM crawl_seen WHERE id IN (${placeholders})`).bind(...ids).all();
+  const byId = new Map((rows.results || []).map((row) => [row.id, row.last_crawled_at]));
+  const now = Date.now();
+  return pairs.filter(({ id }) => {
+    const last = byId.get(id);
+    return !last || now - Date.parse(last) >= CRAWL_FRESH_MS;
+  }).map(({ link }) => link);
 }
 
 async function processQueueJob(job, env) {
@@ -575,7 +627,7 @@ async function crawlPage(source, pageUrl, depth, env, force) {
 
   const seenId = await sha256Hex(`${source.id}\n${normalized}`);
   const seen = await env.DB.prepare("SELECT last_crawled_at FROM crawl_seen WHERE id=?").bind(seenId).first();
-  if (!force && seen?.last_crawled_at && Date.now() - Date.parse(seen.last_crawled_at) < 6 * 60 * 60 * 1000) return;
+  if (!force && seen?.last_crawled_at && Date.now() - Date.parse(seen.last_crawled_at) < CRAWL_FRESH_MS) return;
 
   const res = await fetchWithTimeout(normalized, {
     headers: { "User-Agent": crawlerUa(source), Accept: "text/html,application/xhtml+xml" },
@@ -592,11 +644,11 @@ async function crawlPage(source, pageUrl, depth, env, force) {
   }
 
   if (depth >= 2) return;
-  const links = extractInternalLinks(htmlText, normalized, u.hostname).slice(0, depth === 0 ? 80 : 60);
-  const jobs = links.map((link) => ({ body: { type: "crawl_page", sourceId: source.id, url: link, depth: depth + 1, force: false } }));
-  for (let i = 0; i < jobs.length; i += 100) {
-    await env.CRAWL_QUEUE.sendBatch(jobs.slice(i, i + 100));
-  }
+  const limit = depth === 0 ? CRAWL_ROOT_LINK_LIMIT : CRAWL_SECTION_LINK_LIMIT;
+  const links = extractInternalLinks(htmlText, normalized, u.hostname).slice(0, limit);
+  const dueLinks = await filterFreshCrawlLinks(source, links, env);
+  const jobs = dueLinks.map((link) => ({ body: { type: "crawl_page", sourceId: source.id, url: link, depth: depth + 1, force: false } }));
+  if (jobs.length) await env.CRAWL_QUEUE.sendBatch(jobs);
 }
 
 async function indexUrl(source, url, env, force) {
@@ -656,7 +708,7 @@ async function validateSource(inputUrl, name = "", env = null) {
   assertAllowedUniversityHost(u.hostname);
 
   const homeRes = await fetchWithTimeout(base, {
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; XTU-Search-Validator/2.3.2)", Accept: "text/html,application/xhtml+xml" },
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; XTU-Search-Validator/2.3.3)", Accept: "text/html,application/xhtml+xml" },
   }, 10000);
   if (!homeRes.ok) throw new Error(`首页访问失败 HTTP ${homeRes.status}`);
   const home = await decodeHtmlResponse(homeRes);
@@ -931,7 +983,7 @@ async function probeCrawlSource(base, homeHtml) {
     const sections = direct.filter((x) => !looksLikeArticlePath(new URL(x).pathname)).slice(0, 6);
     for (const link of sections) {
       try {
-        const res = await fetchWithTimeout(link, { headers: { "User-Agent": "Mozilla/5.0 (compatible; XTU-Search-Validator/2.3.2)", Accept: "text/html,application/xhtml+xml" } }, 6000);
+        const res = await fetchWithTimeout(link, { headers: { "User-Agent": "Mozilla/5.0 (compatible; XTU-Search-Validator/2.3.3)", Accept: "text/html,application/xhtml+xml" } }, 6000);
         if (!res.ok) continue;
         const html = await decodeHtmlResponse(res);
         probed.push(link);
@@ -1642,7 +1694,7 @@ function normalizeUrl(input) {
 }
 
 function crawlerUa(source) {
-  return `Mozilla/5.0 (compatible; XTU-Search-MCP/2.3.2; +${source.base_url}/)`;
+  return `Mozilla/5.0 (compatible; XTU-Search-MCP/2.3.3; +${source.base_url}/)`;
 }
 
 async function fetchWithTimeout(input, init, ms) {

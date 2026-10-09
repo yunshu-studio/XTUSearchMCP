@@ -42,14 +42,14 @@
     "consumers": [
       {
         "queue": "xtu-search-crawl",
-        "max_batch_size": 10,
-        "max_batch_timeout": 5,
-        "max_retries": 4,
+        "max_batch_size": 20,
+        "max_batch_timeout": 15,
+        "max_retries": 2,
         "dead_letter_queue": "xtu-search-crawl-dlq"
       }
     ]
   },
   "triggers": {
-    "crons": ["0 */6 * * *"]
+    "crons": ["30 18 * * *"]
   }
 }
